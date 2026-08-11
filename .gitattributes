@@ -1,0 +1,22 @@
+# Set default behavior
+* text=auto
+
+# Declare files that are always text
+*.py text
+*.md text
+*.bat text
+*.yml text
+*.yaml text
+*.json text
+*.txt text
+
+# Declare binary files
+*.png binary
+*.icns binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.app binary
