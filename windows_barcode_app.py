@@ -280,33 +280,63 @@ class Barcode:
         return self.description.encode("ascii")
 
 
-def generate_pdf417_barcode(text, scale=3, columns=6, security_level=2, padding=4, target_size=(400, 100)):
+def _choose_pdf417_layout(text, scale, padding, security_level, target_width, target_height,
+                             default_columns=9, default_ratio=4):
+    target_ratio = target_width / target_height
+    best = None
+    for candidate_columns in (6, 7, 8, 9, 10, 12):
+        codes = encode(text, columns=candidate_columns, security_level=security_level)
+        for candidate_ratio in (2, 3, 4):
+            image = render_image(codes, padding=padding, scale=scale, ratio=candidate_ratio)
+            if image.height == 0:
+                continue
+            scale_factor = min(target_width / image.width, target_height / image.height)
+            scaled_height = int(image.height * scale_factor)
+            aspect = image.width / image.height
+            score = (scaled_height, -abs(aspect - target_ratio))
+            if best is None or score > best[0]:
+                best = (score, candidate_columns, candidate_ratio, image)
+    if best is not None:
+        return best[1], best[2], best[3]
+    codes = encode(text, columns=default_columns, security_level=security_level)
+    return default_columns, default_ratio, render_image(codes, padding=padding, scale=scale, ratio=default_ratio)
+
+
+def generate_pdf417_barcode(text, scale=3, columns=9, security_level=2, padding=4, ratio=4, target_size=None):
     if encode is None or render_image is None:
         raise RuntimeError("pdf417 and Pillow must be installed to generate barcode images.")
-    codes = encode(text, columns=columns, security_level=security_level)
 
     if target_size is not None:
         target_width, target_height = target_size
-        base_image = render_image(codes, padding=padding, scale=scale).convert("RGB")
-        if base_image.width < target_width or base_image.height < target_height:
-            scale_w = max(1, target_width // base_image.width)
-            scale_h = max(1, target_height // base_image.height)
-            dynamic_scale = max(scale, min(scale_w, scale_h))
-            barcode_image = render_image(codes, padding=padding, scale=dynamic_scale).convert("RGB")
+        if target_height is not None:
+            columns, ratio, base_image = _choose_pdf417_layout(text, scale, padding, security_level, target_width, target_height)
         else:
-            barcode_image = base_image
+            codes = encode(text, columns=columns, security_level=security_level)
+            base_image = render_image(codes, padding=padding, scale=scale, ratio=ratio)
     else:
-        barcode_image = render_image(codes, padding=padding, scale=scale).convert("RGB")
+        codes = encode(text, columns=columns, security_level=security_level)
+        base_image = render_image(codes, padding=padding, scale=scale, ratio=ratio)
+
+    base_image = base_image.convert("RGB")
 
     if target_size is None:
-        return barcode_image
+        return base_image
 
-    barcode_width, barcode_height = barcode_image.size
+    target_width, target_height = target_size
+    if target_height is None:
+        scale_factor = target_width / base_image.width
+        resize_width = max(1, int(base_image.width * scale_factor))
+        resize_height = max(1, int(base_image.height * scale_factor))
+        return base_image.resize((resize_width, resize_height), Image.NEAREST)
+
+    barcode_width, barcode_height = base_image.size
     scale_factor = min(target_width / barcode_width, target_height / barcode_height)
     resize_width = max(1, int(barcode_width * scale_factor))
     resize_height = max(1, int(barcode_height * scale_factor))
     if resize_width != barcode_width or resize_height != barcode_height:
-        barcode_image = barcode_image.resize((resize_width, resize_height), Image.LANCZOS)
+        barcode_image = base_image.resize((resize_width, resize_height), Image.NEAREST)
+    else:
+        barcode_image = base_image
 
     padded = Image.new("RGB", (target_width, target_height), "white")
     offset_x = (target_width - barcode_image.width) // 2
@@ -499,6 +529,12 @@ AAMVA_VERSION_BY_YEAR = [
 ]
 
 DOCUMENT_DISCRIMINATOR_LENGTH = 25
+
+# Per-state document discriminator lengths. Default is 25 unless overridden here.
+STATE_DD_LENGTHS = {
+    "NV": 21,
+    # add other states here if needed
+}
 
 LICENSE_FORMAT_REFERENCE = """
 State - License Format
@@ -792,10 +828,11 @@ def validate_profile(profile):
     if not re.fullmatch(r"\d{2}", profile["jurisdiction_version"].strip()):
         errors.append("Jurisdiction version must be a two-digit number.")
     dd = profile["document_discriminator"].strip()
+    expected_dd_len = STATE_DD_LENGTHS.get(profile.get("state_code"), DOCUMENT_DISCRIMINATOR_LENGTH)
     if not dd:
         errors.append("Document discriminator cannot be empty.")
-    elif not re.fullmatch(r"[A-Za-z0-9]{25}", dd):
-        errors.append("Document discriminator must be 25 alphanumeric characters.")
+    elif not re.fullmatch(r"[A-Za-z0-9]{%d}" % expected_dd_len, dd):
+        errors.append(f"Document discriminator must be {expected_dd_len} alphanumeric characters for state {profile.get('state_code')}")
     if profile["state_code"] in STATE_DL_FORMAT_PATTERNS:
         pattern = STATE_DL_FORMAT_PATTERNS[profile["state_code"]]
         if not re.fullmatch(pattern, profile["customer_id"].strip()):
@@ -1027,7 +1064,7 @@ class BarcodeApp(tk.Tk):
         barcode = build_barcode_profile(profile)
         text = barcode.description
         try:
-            image = generate_pdf417_barcode(text, target_size=(400, 100))
+            image = generate_pdf417_barcode(text)
         except Exception as exc:
             messagebox.showerror("Barcode Generation Error", str(exc))
             return
@@ -1103,7 +1140,7 @@ class BarcodeApp(tk.Tk):
             return
         try:
             barcode = build_barcode_profile(profile)
-            image = generate_pdf417_barcode(barcode.description, target_size=(400, 100))
+            image = generate_pdf417_barcode(barcode.description)
             self._render_image(image)
             self._set_status("Barcode generated successfully.")
             self._set_raw_text(barcode.description)
@@ -1113,12 +1150,22 @@ class BarcodeApp(tk.Tk):
     def on_generate_dd_clicked(self):
         version_widget = self.fields.get("aamva_version")
         discriminator_widget = self.fields.get("document_discriminator")
+        state_widget = self.fields.get("state_code")
         if not isinstance(discriminator_widget, ttk.Entry):
             return
         version = "00"
         if isinstance(version_widget, ttk.Entry):
             version = version_widget.get().strip() or version
-        generated = generate_document_discriminator(version)
+        state_code = None
+        if isinstance(state_widget, ttk.OptionMenu):
+            state_code = state_widget.variable.get().strip()
+        expected_len = STATE_DD_LENGTHS.get(state_code, DOCUMENT_DISCRIMINATOR_LENGTH)
+        base = generate_document_discriminator(version)
+        if len(base) < expected_len:
+            extra = "".join(str(random.randint(0, 9)) for _ in range(expected_len - len(base)))
+            generated = base + extra
+        else:
+            generated = base[:expected_len]
         discriminator_widget.delete(0, tk.END)
         discriminator_widget.insert(0, generated)
         self._set_status("Generated document discriminator for version {}.".format(version))
@@ -1134,7 +1181,9 @@ class BarcodeApp(tk.Tk):
             messagebox.showinfo("Validation Passed", "Profile is valid for AAMVA formatting.")
 
     def _render_image(self, image):
-        resized = image.resize((min(image.width, 500), min(image.height, 200)))
+        max_width, max_height = 500, 200
+        scale = min(max_width / image.width, max_height / image.height, 1)
+        resized = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.NEAREST)
         self.photo = ImageTk.PhotoImage(resized)
         self.image_label.configure(image=self.photo)
 
@@ -1211,17 +1260,21 @@ def run_gui():
 # CLI implementation
 # ---------------------------------------------------------------------------
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Linux AAMVA barcode generator clone")
+    parser = argparse.ArgumentParser(description="Windows AAMVA barcode generator clone")
     parser.add_argument("--gui", action="store_true", help="Launch the Tkinter GUI")
     parser.add_argument("--out", default="barcode.png", help="Output PNG image path")
     parser.add_argument("--print-data", action="store_true", help="Print raw AAMVA data string")
     parser.add_argument("--config", help="Load profile from JSON file")
     parser.add_argument("--save-profile", help="Write the active profile to a JSON file")
     parser.add_argument("--validate-only", action="store_true", help="Validate profile only and exit")
-    parser.add_argument("--dpi", type=int, default=200, help="Render image at this DPI for 2x0.5 inch output")
+    parser.add_argument("--dpi", type=int, default=200,
+                        help="Render image at this DPI for a 2-inch output width by default")
+    parser.add_argument("--width", type=int, help="Optional output width in pixels")
+    parser.add_argument("--height", type=int, help="Optional output height in pixels")
     parser.add_argument("--scale", type=int, default=3, help="PDF417 scale factor")
     parser.add_argument("--columns", type=int, default=6, help="PDF417 column count")
     parser.add_argument("--security-level", type=int, default=2, help="PDF417 security level")
+    parser.add_argument("--ratio", type=int, default=2, help="PDF417 module aspect ratio (2 = good width-to-height balance)")
     parser.add_argument("--parse-aamva", help="Parse raw AAMVA data from a file and print the resulting profile")
     args = parser.parse_args(argv)
 
@@ -1258,13 +1311,20 @@ def main(argv=None):
     if args.print_data:
         sys.stdout.write(barcode.description)
 
-    target_size = (int(2 * args.dpi), int(0.5 * args.dpi))
+    if args.width is not None or args.height is not None:
+        target_width = args.width if args.width is not None else int(2 * args.dpi)
+        target_height = args.height if args.height is not None else None
+        target_size = (target_width, target_height)
+    else:
+        target_size = (int(2 * args.dpi), None)
+
     image = generate_pdf417_barcode(barcode.description, scale=args.scale,
                                     columns=args.columns,
                                     security_level=args.security_level,
+                                    ratio=args.ratio,
                                     target_size=target_size)
     image.save(args.out, dpi=(args.dpi, args.dpi))
-    print(f"Saved barcode image to {args.out} at {args.dpi} DPI ({target_size[0]}x{target_size[1]} pixels)")
+    print(f"Saved barcode image to {args.out} at {args.dpi} DPI ({image.width}x{image.height} pixels)")
     if args.save_profile:
         save_profile(args.save_profile, profile)
         print(f"Saved profile to {args.save_profile}")
